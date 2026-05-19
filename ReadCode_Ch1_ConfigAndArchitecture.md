@@ -6,6 +6,85 @@
 
 ## 1.1 统一语音-文本建模架构
 
+### 1.1.0 整体架构图
+
+```mermaid
+graph TB
+    subgraph 输入
+        Text[文本 Token]
+        Audio[语音波形 24kHz]
+    end
+
+    subgraph 分词器
+        AT[Acoustic Tokenizer<br/>64维 · 可编解码]
+        ST[Semantic Tokenizer<br/>128维 · 仅编码]
+    end
+
+    subgraph 连接器
+        AC[Acoustic Connector<br/>fc1→RMSNorm→fc2]
+        SC[Semantic Connector<br/>fc1→RMSNorm→fc2]
+    end
+
+    subgraph LLM骨干
+        Qwen2[Qwen2 LLM<br/>文本理解 + 条件生成]
+    end
+
+    subgraph 输出头
+        DH[Diffusion Head<br/>v-prediction · DPM-Solver]
+        LM_HEAD[lm_head<br/>文本生成]
+    end
+
+    subgraph 解码
+        DEC[Acoustic Decoder<br/>latent → 波形]
+    end
+
+    Text --> Qwen2
+    Audio --> AT
+    Audio --> ST
+    AT --> |sample| AC
+    ST --> |mean| SC
+    AC --> |+| Qwen2
+    SC --> |+| Qwen2
+    Qwen2 --> |语音位置隐状态| DH
+    Qwen2 --> |文本位置logits| LM_HEAD
+    DH --> |去噪latent| DEC
+    DEC --> |波形| Output[输出音频]
+
+    style AT fill:#e1f5fe
+    style ST fill:#e8f5e9
+    style Qwen2 fill:#fff3e0
+    style DH fill:#fce4ec
+```
+
+### 1.1.1 三大模型变体架构对比图
+
+```mermaid
+graph LR
+    subgraph TTS模型
+        T_IN[文本+语音样本] --> T_LLM[Qwen2-1.5B]
+        T_LLM --> T_DH[Diffusion Head]
+        T_DH --> T_OUT[语音输出]
+    end
+
+    subgraph ASR模型
+        A_IN[音频] --> A_ENC[双Tokenizer+Connector]
+        A_ENC --> A_LLM[Qwen2-7B]
+        A_LLM --> A_OUT[文本输出]
+    end
+
+    subgraph Streaming模型
+        S_IN[文本+音色] --> S_LM[下层LM<br/>文本编码]
+        S_LM --> S_TTS[上层TTS LM<br/>语音生成]
+        S_TTS --> S_DH[Diffusion Head]
+        S_DH --> S_DEC[Acoustic Decoder]
+        S_DEC --> S_OUT[流式音频]
+    end
+
+    style T_DH fill:#fce4ec
+    style A_LLM fill:#e8f5e9
+    style S_TTS fill:#fff3e0
+```
+
 VibeVoice 的核心设计理念是**将语音视为一种可与文本交替的"语言"**，通过统一的 Transformer 架构同时处理文本和语音：
 
 ```
@@ -83,6 +162,36 @@ class SpeechConnector(nn.Module):
 ---
 
 ## 1.3 配置系统详解
+
+### 1.3.0 配置组合层次图
+
+```mermaid
+graph TD
+    subgraph VibeVoiceConfig
+        ATC[AcousticTokenizerConfig<br/>vae_dim=64 · fix_std=0.5<br/>std_dist_type=gaussian]
+        STC[SemanticTokenizerConfig<br/>vae_dim=128 · fix_std=0<br/>std_dist_type=none]
+        DC[Qwen2Config<br/>1.5B: 28层 · 1536维<br/>7B: 28层 · 3584维]
+        DHC[DiffusionHeadConfig<br/>v_prediction · cosine<br/>head_num_layers=8]
+    end
+
+    subgraph VibeVoiceStreamingConfig
+        ATC2[AcousticTokenizerConfig]
+        DC2[Qwen2Config<br/>0.5B · 分层]
+        DHC2[DiffusionHeadConfig]
+        TBNHL[tts_backbone_num_hidden_layers]
+    end
+
+    ATC --> |编码器| AT_MODEL[Acoustic Tokenizer]
+    STC --> |编码器| ST_MODEL[Semantic Tokenizer]
+    DC --> |LLM| QWEN_MODEL[Qwen2ForCausalLM]
+    DHC --> |扩散| DH_MODEL[DiffusionHead]
+
+    style ATC fill:#e1f5fe
+    style STC fill:#e8f5e9
+    style DC fill:#fff3e0
+    style DHC fill:#fce4ec
+    style TBNHL fill:#f3e5f5
+```
 
 ### 1.3.1 VibeVoiceConfig（`configuration_vibevoice.py`）
 
@@ -235,6 +344,24 @@ elif isinstance(acoustic_tokenizer_config, VibeVoiceAcousticTokenizerConfig):
 
 ## 1.5 语音特征归一化
 
+### 1.5.0 归一化流程图
+
+```mermaid
+flowchart LR
+    A[Acoustic Tokens<br/>原始分布] --> B{首次遇到?}
+    B --> |是| C[计算 mean 和 std]
+    C --> D[all_reduce 同步<br/>多GPU平均]
+    D --> E[保存 scaling_factor<br/>和 bias_factor]
+    B --> |否| F[使用已保存的因子]
+    E --> G[归一化<br/>x = (x + bias) × scale]
+    F --> G
+    G --> H[N(0,1) 分布<br/>利于扩散头训练]
+
+    style A fill:#e1f5fe
+    style G fill:#e8f5e9
+    style H fill:#fff3e0
+```
+
 ### 1.5.1 缩放因子计算
 
 ```python
@@ -328,47 +455,40 @@ def _init_cache_for_generation(model, batch_size, dtype, ...):
 
 ## 1.8 模块间依赖关系
 
-```
-                    ┌─────────────────────┐
-                    │  configuration_      │
-                    │  vibevoice.py        │
-                    └──────────┬──────────┘
-                               │
-              ┌────────────────┼────────────────┐
-              │                │                │
-    ┌─────────▼──────┐  ┌─────▼──────┐  ┌──────▼──────────────┐
-    │ modular_vibe-  │  │ modeling_  │  │ configuration_vibe-  │
-    │ voice_tokenizer│  │ vibevoice  │  │ voice_streaming.py   │
-    └───────┬────────┘  └─────┬──────┘  └──────────┬──────────┘
-            │                 │                     │
-            │     ┌───────────┼───────────┐        │
-            │     │           │           │        │
-    ┌───────▼─────▼──┐ ┌─────▼─────┐ ┌───▼────────▼────────┐
-    │ modular_vibe-  │ │ modeling_ │ │ modeling_vibevoice_  │
-    │ voice_diffu-  │ │ vibevoice │ │ streaming.py         │
-    │ sion_head.py  │ │ _asr.py   │ └──────────┬───────────┘
-    └───────┬────────┘ └───────────┘            │
-            │                                    │
-    ┌───────▼────────┐              ┌───────────▼───────────┐
-    │ schedule/      │              │ modeling_vibevoice_   │
-    │ dpm_solver.py  │              │ streaming_inference.py│
-    └────────────────┘              └───────────────────────┘
+### 1.8.0 模块依赖图
 
-    ┌──────────────────────────────────────────────────────┐
-    │ processor/                                           │
-    │ ├── vibevoice_processor.py      ← TTS 数据处理       │
-    │ ├── vibevoice_asr_processor.py  ← ASR 数据处理       │
-    │ ├── vibevoice_streaming_processor.py ← 流式数据处理  │
-    │ ├── vibevoice_tokenizer_processor.py ← 分词器处理    │
-    │ └── audio_utils.py             ← 音频工具            │
-    └──────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    CONFIG[configuration_vibevoice.py] --> |配置| TOKENIZER[modular_vibevoice_tokenizer.py]
+    CONFIG --> |配置| DIFFHEAD[modular_vibevoice_diffusion_head.py]
+    CONFIG --> |配置| TTS_MODEL[modeling_vibevoice.py]
+    CONFIG --> |配置| ASR_MODEL[modeling_vibevoice_asr.py]
 
-    ┌──────────────────────────────────────────────────────┐
-    │ vllm_plugin/                                         │
-    │ ├── __init__.py    ← 注册入口                        │
-    │ ├── model.py       ← 模型封装（依赖 modular/）       │
-    │ └── inputs.py      ← 音频输入映射（依赖 processor/） │
-    └──────────────────────────────────────────────────────┘
+    SCONFIG[configuration_vibevoice_streaming.py] --> |配置| STREAM_MODEL[modeling_vibevoice_streaming.py]
+
+    TOKENIZER --> |编码/解码| TTS_MODEL
+    TOKENIZER --> |编码| ASR_MODEL
+    TOKENIZER --> |编码/解码| STREAM_MODEL
+
+    DIFFHEAD --> |扩散预测| TTS_MODEL
+    DIFFHEAD --> |扩散预测| STREAM_MODEL
+
+    DPM[schedule/dpm_solver.py] --> |调度| DIFFHEAD
+
+    STREAM_MODEL --> |推理逻辑| STREAM_INF[modeling_vibevoice_streaming_inference.py]
+
+    PROC_TTS[processor/vibevoice_processor.py] --> |数据处理| TTS_MODEL
+    PROC_ASR[processor/vibevoice_asr_processor.py] --> |数据处理| ASR_MODEL
+    PROC_STREAM[processor/vibevoice_streaming_processor.py] --> |数据处理| STREAM_MODEL
+
+    VLLM[vllm_plugin/model.py] --> |封装| ASR_MODEL
+    VLLM_IN[vllm_plugin/inputs.py] --> |音频输入| VLLM
+
+    style CONFIG fill:#e1f5fe
+    style SCONFIG fill:#e1f5fe
+    style TOKENIZER fill:#e8f5e9
+    style DIFFHEAD fill:#fce4ec
+    style DPM fill:#f3e5f5
 ```
 
 配置系统是整个项目的基石，所有模型变体都通过组合配置来定义其子模块结构。理解配置系统是理解整个 VibeVoice 架构的关键入口。

@@ -6,6 +6,53 @@
 
 ## 2.1 整体架构
 
+### 2.1.0 分词器架构图
+
+```mermaid
+graph TB
+    subgraph 编码器 TokenizerEncoder
+        STEM_E[stem: SConv1d<br/>1→32 · k=7]
+        S0[stage0: 3×Block1D<br/>32→64 · ↓8]
+        S1[stage1: 3×Block1D<br/>64→128 · ↓5]
+        S2[stage2: 3×Block1D<br/>128→256 · ↓5]
+        S3[stage3: 3×Block1D<br/>256→512 · ↓4]
+        S4[stage4: 3×Block1D<br/>512→1024 · ↓2]
+        S5[stage5: 3×Block1D<br/>1024→2048 · ↓2]
+        S6[stage6: 8×Block1D<br/>2048]
+        HEAD_E[head: SConv1d<br/>2048→64 · k=7]
+    end
+
+    subgraph 采样
+        MEAN[mean]
+        STD[std]
+        SAMPLE[sample<br/>fix/gaussian/none]
+    end
+
+    subgraph 解码器 TokenizerDecoder
+        HEAD_D[stem: SConv1d<br/>64→2048 · k=7]
+        S6_D[stage0: 8×Block1D<br/>2048]
+        S5_D[stage1: 3×Block1D<br/>↑2 · 1024→2048]
+        S4_D[stage2: 3×Block1D<br/>↑2 · 512→1024]
+        S3_D[stage3: 3×Block1D<br/>↑4 · 256→512]
+        S2_D[stage4: 3×Block1D<br/>↑5 · 128→256]
+        S1_D[stage5: 3×Block1D<br/>↑5 · 64→128]
+        S0_D[stage6: 3×Block1D<br/>↑8 · 32→64]
+        OUT_D[head: SConv1d<br/>32→1 · k=7]
+    end
+
+    INPUT[输入波形<br/>B,1,T @24kHz] --> STEM_E
+    STEM_E --> S0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> HEAD_E
+    HEAD_E --> MEAN --> SAMPLE
+    HEAD_E --> STD --> SAMPLE
+    SAMPLE --> |latent<br/>B,64,T/3200 @7.5Hz| HEAD_D
+    HEAD_D --> S6_D --> S5_D --> S4_D --> S3_D --> S2_D --> S1_D --> S0_D --> OUT_D
+    OUT_D --> OUTPUT[输出波形<br/>B,1,T @24kHz]
+
+    style INPUT fill:#e1f5fe
+    style OUTPUT fill:#e8f5e9
+    style SAMPLE fill:#fff3e0
+```
+
 ```
 VibeVoiceAcousticTokenizerModel
 ├── encoder: TokenizerEncoder
@@ -94,6 +141,29 @@ class Block1D(nn.Module):
 
 ### 2.3.2 前向传播
 
+#### Block1D 内部结构图
+
+```mermaid
+flowchart LR
+    subgraph 分支1_DWConv_+_Layer_Scale
+        X1[x] --> N1[RMSNorm]
+        N1 --> DW[DepthwiseConv1d<br/>k=7 · groups=dim]
+        DW --> M1["× γ<br/>(Layer Scale)"]
+        M1 --> ADD1["+ 残差"]
+    end
+
+    subgraph 分支2_FFN_+_Layer_Scale
+        X2[x] --> N2[RMSNorm]
+        N2 --> PW1[Linear<br/>dim → 4×dim]
+        PW1 --> ACT[GELU]
+        ACT --> PW2[Linear<br/>4×dim → dim]
+        PW2 --> M2["× γ_ffn<br/>(Layer Scale)"]
+        M2 --> ADD2["+ 残差"]
+    end
+
+    ADD1 --> ADD2
+```
+
 ```
 x → dwconv(norm(x)) * γ → +residual → pwconv2(act(pwconv1(norm(x)))) * γ_ffn → +residual
 ```
@@ -130,6 +200,22 @@ def forward(self, x):
 ---
 
 ## 2.4 流式卷积层
+
+### 2.4.0 流式卷积缓存机制图
+
+```mermaid
+sequenceDiagram
+    participant C as 缓存 Cache
+    participant S1 as Chunk 1
+    participant S2 as Chunk 2
+
+    Note over C: 初始为空
+    S1->>C: 保存尾部 context_size 个样本
+    C->>S2: 提供上一 chunk 的尾部样本
+    S2->>S2: 拼接 [缓存 + 当前输入]
+    S2->>S2: 执行卷积
+    S2->>C: 更新缓存（保留新尾部）
+```
 
 ### 2.4.1 SConv1d（Streaming Conv1d）
 
@@ -186,6 +272,45 @@ class SConvTranspose1d(nn.Module):
 
 ## 2.5 流式缓存机制
 
+### 2.5.0 长音频流式编码流程图
+
+```mermaid
+flowchart TD
+    A[长音频 >60s] --> B[按60s分段]
+    B --> C1[Chunk 1]
+    B --> C2[Chunk 2]
+    B --> C3[Chunk N]
+
+    C1 --> |共享Cache| E1[Acoustic Encode]
+    C2 --> |共享Cache| E2[Acoustic Encode]
+    C3 --> |共享Cache| E3[Acoustic Encode]
+
+    E1 --> M1[mean₁]
+    E2 --> M2[mean₂]
+    E3 --> M3[mean₃]
+
+    M1 --> |拼接| CAT[cat all means]
+    M2 --> CAT
+    M3 --> CAT
+    CAT --> |统一采样| SAMPLE[sample<br/>mean + fix_std×randn]
+    SAMPLE --> RESULT[全局一致的<br/>Acoustic Tokens]
+
+    C1 --> |共享Cache| SE1[Semantic Encode]
+    C2 --> |共享Cache| SE2[Semantic Encode]
+    C3 --> |共享Cache| SE3[Semantic Encode]
+    SE1 --> SM1[mean₁]
+    SE2 --> SM2[mean₂]
+    SE3 --> SM3[mean₃]
+    SM1 --> |直接拼接| SRESULT[Semantic Tokens<br/>确定性 · 无需采样]
+    SM2 --> SRESULT
+    SM3 --> SRESULT
+
+    style A fill:#e1f5fe
+    style SAMPLE fill:#fff3e0
+    style RESULT fill:#e8f5e9
+    style SRESULT fill:#e8f5e9
+```
+
 ### 2.5.1 VibeVoiceTokenizerStreamingCache
 
 ```python
@@ -240,6 +365,31 @@ def encode_long_audio(self, audio, sample_rate=24000):
 ---
 
 ## 2.6 采样策略
+
+### 2.6.0 三种采样策略对比图
+
+```mermaid
+flowchart LR
+    subgraph fix模式_Acoustic默认
+        F_M[mean] --> F_ADD["+ fix_std × randn"]
+        F_STD[fix_std=0.5] --> F_ADD
+        F_ADD --> F_OUT[固定方差的采样]
+    end
+
+    subgraph gaussian模式
+        G_M[mean] --> G_ADD["+ randn×std/0.8 × randn"]
+        G_STD[std] --> G_ADD
+        G_ADD --> G_OUT[随机方差的采样]
+    end
+
+    subgraph none模式_Semantic默认
+        N_M[mean] --> N_OUT[直接返回 mean<br/>确定性 · 无随机性]
+    end
+
+    style F_OUT fill:#e1f5fe
+    style G_OUT fill:#fff3e0
+    style N_OUT fill:#e8f5e9
+```
 
 ### 2.6.1 VibeVoiceTokenizerEncoderOutput
 

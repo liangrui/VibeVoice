@@ -55,6 +55,48 @@ LLM 骨干占据了绝大部分参数，分词器和扩散头相对轻量。
 
 ## 4.2 TTS 训练前向传播
 
+### 4.2.0 TTS 训练数据流图
+
+```mermaid
+flowchart TD
+    subgraph 输入
+        IDS[input_ids<br/>文本+语音占位符]
+        SPEECH[speech_tensors<br/>音频波形]
+        MASK_I[acoustic_input_mask<br/>语音输入位置]
+        MASK_L[acoustic_loss_mask<br/>扩散损失位置]
+        LABELS[labels<br/>文本目标]
+    end
+
+    subgraph 语音编码
+        SPEECH --> AT[Acoustic Tokenizer<br/>encode → sample]
+        SPEECH --> ST[Semantic Tokenizer<br/>encode → mean]
+        AT --> |64维| AC[Acoustic Connector]
+        ST --> |128维| SC[Semantic Connector]
+        AC --> |hidden_size| MERGE["+"]
+        SC --> |hidden_size| MERGE
+    end
+
+    subgraph LLM前向
+        IDS --> EMB[embed_tokens]
+        EMB --> REPLACE["替换语音位置嵌入<br/>inputs_embeds[mask] = merge"]
+        MERGE --> REPLACE
+        REPLACE --> QWEN[Qwen2 LLM]
+    end
+
+    subgraph 损失计算
+        QWEN --> |文本logits| CE["CE Loss<br/>next-token预测"]
+        QWEN --> |语音位置隐状态| DIFF["Diffusion Loss<br/>v-prediction MSE"]
+    end
+
+    MASK_I --> REPLACE
+    MASK_L --> DIFF
+    LABELS --> CE
+
+    style CE fill:#e1f5fe
+    style DIFF fill:#fce4ec
+    style MERGE fill:#fff3e0
+```
+
 ### 4.2.1 完整流程
 
 ```python
@@ -221,6 +263,57 @@ class VibeVoiceASRForConditionalGeneration(VibeVoicePreTrainedModel):
 
 ## 4.6 ASR 语音编码
 
+### 4.6.0 ASR 长音频编码流程图
+
+```mermaid
+flowchart TD
+    A[音频输入] --> B{时长 > 60s?}
+
+    B --> |否 · 短音频| C1[直接编码]
+    C1 --> AT1[Acoustic Tokenizer<br/>encode → sample]
+    C1 --> ST1[Semantic Tokenizer<br/>encode → mean]
+    AT1 --> AC1[Acoustic Connector]
+    ST1 --> SC1[Semantic Connector]
+    AC1 --> R1["+"]
+    SC1 --> R1
+    R1 --> OUT[语音特征]
+
+    B --> |是 · 长音频| D[按60s分段]
+    D --> E1[Chunk 1]
+    D --> E2[Chunk 2]
+    D --> E3[Chunk N]
+
+    E1 --> |共享Cache| F1[Acoustic Encode]
+    E2 --> |共享Cache| F2[Acoustic Encode]
+    E3 --> |共享Cache| F3[Acoustic Encode]
+    F1 --> G1[mean₁]
+    F2 --> G2[mean₂]
+    F3 --> G3[mean₃]
+    G1 --> |拼接+统一采样| H1[Acoustic Tokens]
+    G2 --> H1
+    G3 --> H1
+    H1 --> AC2[Acoustic Connector]
+
+    E1 --> |共享Cache| I1[Semantic Encode]
+    E2 --> |共享Cache| I2[Semantic Encode]
+    E3 --> |共享Cache| I3[Semantic Encode]
+    I1 --> J1[mean₁]
+    I2 --> J2[mean₂]
+    I3 --> J3[mean₃]
+    J1 --> |直接拼接| H2[Semantic Tokens]
+    J2 --> H2
+    J3 --> H2
+    H2 --> SC2[Semantic Connector]
+
+    AC2 --> R2["+"]
+    SC2 --> R2
+    R2 --> OUT
+
+    style A fill:#e1f5fe
+    style OUT fill:#e8f5e9
+    style H1 fill:#fff3e0
+```
+
 ### 4.6.1 encode_speech 方法
 
 ```python
@@ -342,6 +435,43 @@ Step 4: 遇到 EOS 或达到 max_new_tokens 时停止
 ---
 
 ## 4.10 数据流图
+
+### 4.10.0 TTS vs ASR 架构对比图
+
+```mermaid
+graph TB
+    subgraph TTS训练
+        T_SCRIPT[播客脚本] --> T_PROC[VibeVoiceProcessor]
+        T_AUDIO[语音样本] --> T_AT[Acoustic Tokenizer]
+        T_AUDIO --> T_ST[Semantic Tokenizer]
+        T_AT --> T_AC[Acoustic Connector]
+        T_ST --> T_SC[Semantic Connector]
+        T_AC --> T_MERGE["+ "]
+        T_SC --> T_MERGE
+        T_PROC --> T_LLM[Qwen2-1.5B]
+        T_MERGE --> T_LLM
+        T_LLM --> T_CE[CE Loss]
+        T_LLM --> T_DH[Diffusion Head]
+        T_DH --> T_DL[Diffusion Loss]
+    end
+
+    subgraph ASR推理
+        A_FILE[音频文件] --> A_NORM[ffmpeg + 归一化]
+        A_NORM --> A_AT[Acoustic Tokenizer]
+        A_NORM --> A_ST[Semantic Tokenizer]
+        A_AT --> A_AC[Acoustic Connector]
+        A_ST --> A_SC[Semantic Connector]
+        A_AC --> A_MERGE["+ "]
+        A_SC --> A_MERGE
+        A_MERGE --> A_LLM[Qwen2-7B]
+        A_LLM --> A_HEAD[lm_head]
+        A_HEAD --> A_TEXT[转写文本]
+    end
+
+    style T_CE fill:#e1f5fe
+    style T_DL fill:#fce4ec
+    style A_TEXT fill:#e8f5e9
+```
 
 ### 4.10.1 TTS 训练数据流
 

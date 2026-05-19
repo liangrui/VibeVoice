@@ -6,6 +6,35 @@
 
 ## 6.1 数据处理器总览
 
+### 6.1.0 三种处理器对比图
+
+```mermaid
+graph TB
+    subgraph VibeVoiceProcessor_TTS
+        T_SCRIPT[播客脚本<br/>Speaker X: text] --> T_PARSE[脚本解析]
+        T_PARSE --> T_TOKEN["构建 token 序列<br/>system + voice + text + speech"]
+        T_TOKEN --> T_INSERT["插入特殊 token<br/>vision_start + N×vision_pad + vision_end"]
+        T_INSERT --> T_OUT["input_ids + speech_input_mask<br/>+ speech_tensors"]
+    end
+
+    subgraph VibeVoiceASRProcessor_ASR
+        A_AUDIO[音频文件] --> A_LOAD["ffmpeg加载<br/>24kHz重采样"]
+        A_LOAD --> A_NORM[dB归一化]
+        A_NORM --> A_CHAT["构建聊天模板<br/>object_ref_start + N×box_start + object_ref_end"]
+        A_CHAT --> A_OUT["input_ids + acoustic_input_mask<br/>+ speech_tensors"]
+    end
+
+    subgraph VibeVoiceStreamingProcessor_Streaming
+        S_TEXT[文本] --> S_VOICE[Voice Prompt]
+        S_VOICE --> S_CACHE["process_input_with_cached_prompt<br/>支持KV Cache复用"]
+        S_CACHE --> S_OUT["tts_lm_input_ids<br/>+ tts_text_ids"]
+    end
+
+    style T_INSERT fill:#e1f5fe
+    style A_CHAT fill:#e8f5e9
+    style S_CACHE fill:#fff3e0
+```
+
 VibeVoice 提供三种处理器，分别对应三种模型变体：
 
 | 处理器 | 模型变体 | 特殊 Token | 输出 |
@@ -162,6 +191,45 @@ class AudioNormalizer:
 ---
 
 ## 6.7 vLLM 插件
+
+### 6.7.0 vLLM 插件架构图
+
+```mermaid
+graph TB
+    subgraph 注册入口___init__.py
+        REG["register()<br/>AutoConfig + AutoTokenizer<br/>+ ModelRegistry"]
+    end
+
+    subgraph 模型封装_model.py
+        AE["VibeVoiceAudioEncoder<br/>Acoustic Tokenizer + Semantic Tokenizer<br/>+ Connectors"]
+        MMP["VibeVoiceMultiModalProcessor<br/>AUDIO占位符 → 语音token序列"]
+        VLM["VibeVoiceForCausalLM<br/>SupportsMultiModal + SupportsPP"]
+    end
+
+    subgraph 输入映射_inputs.py
+        AIM["VibeVoiceAudioInputMapper<br/>文件/bytes/numpy → tensor<br/>+ AudioNormalizer + 时长限制"]
+    end
+
+    subgraph 工具
+        GEN["generate_tokenizer_files.py<br/>添加特殊token到Qwen2分词器"]
+    end
+
+    subgraph 部署
+        START["start_server.py<br/>安装依赖 → 下载模型<br/>→ 生成tokenizer → 启动vLLM<br/>→ nginx负载均衡"]
+    end
+
+    REG --> VLM
+    AE --> VLM
+    MMP --> VLM
+    AIM --> AE
+    GEN --> START
+    START --> VLM
+
+    style REG fill:#e1f5fe
+    style AE fill:#e8f5e9
+    style VLM fill:#fff3e0
+    style START fill:#fce4ec
+```
 
 ### 6.7.1 注册入口（`__init__.py`）
 
@@ -375,6 +443,54 @@ class VibeVoiceASRTextTokenizerFast(PreTrainedTokenizerFast):
 ---
 
 ## 6.12 数据流图
+
+### 6.12.0 完整部署架构图
+
+```mermaid
+graph TB
+    subgraph 客户端
+        CLI[CLI / API 调用]
+        WEB[Web 浏览器<br/>Gradio / WebSocket]
+    end
+
+    subgraph 服务层
+        VLLM[vLLM Server<br/>ASR 推理服务]
+        FASTAPI[FastAPI Server<br/>Streaming TTS 服务]
+    end
+
+    subgraph 模型层
+        ASR_M[VibeVoiceASRModel<br/>Qwen2-7B + 双Tokenizer]
+        STREAM_M[VibeVoiceStreamingModel<br/>Qwen2-0.5B分层 + Diffusion]
+    end
+
+    subgraph 数据处理
+        PROC_ASR[VibeVoiceASRProcessor]
+        PROC_STREAM[VibeVoiceStreamingProcessor]
+        NORM[AudioNormalizer<br/>-25 dB FS]
+    end
+
+    subgraph 基础设施
+        NGINX[Nginx<br/>负载均衡]
+        FFmpeg[FFmpeg<br/>音频解码/重采样]
+    end
+
+    CLI --> |HTTP API| VLLM
+    WEB --> |WebSocket| FASTAPI
+    VLLM --> ASR_M
+    FASTAPI --> STREAM_M
+    ASR_M --> PROC_ASR
+    STREAM_M --> PROC_STREAM
+    PROC_ASR --> NORM
+    PROC_STREAM --> NORM
+    NORM --> FFmpeg
+    VLLM --> NGINX
+
+    style CLI fill:#e1f5fe
+    style WEB fill:#e1f5fe
+    style ASR_M fill:#e8f5e9
+    style STREAM_M fill:#fff3e0
+    style NGINX fill:#fce4ec
+```
 
 ### 6.12.1 vLLM ASR 服务数据流
 

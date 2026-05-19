@@ -6,6 +6,72 @@
 
 ## 3.1 扩散头整体架构
 
+### 3.1.0 扩散头架构图
+
+```mermaid
+graph TB
+    subgraph 输入
+        LATENT[加噪语音 Latent<br/>B,1,vae_dim]
+        T[时间步 t]
+        COND[LLM 条件<br/>B,1,hidden_size]
+    end
+
+    subgraph 条件处理
+        CP[cond_proj<br/>hidden_size → cond_dim]
+        TE[TimestepEmbedder<br/>sinusoidal → MLP<br/>→ cond_dim]
+        ADD["+ 条件组合"]
+    end
+
+    subgraph 主干
+        PROJ[noisy_images_proj<br/>vae_dim → hidden_size]
+        HL1[HeadLayer 1<br/>AdaLN调制]
+        HL2[HeadLayer 2<br/>AdaLN调制]
+        HLN[HeadLayer N<br/>AdaLN调制]
+        FL[FinalLayer<br/>AdaLN → Linear]
+    end
+
+    subgraph 输出
+        V_PRED[v-prediction<br/>B,1,vae_dim]
+    end
+
+    LATENT --> PROJ
+    COND --> CP --> ADD
+    T --> TE --> ADD
+    ADD --> |c| HL1
+    PROJ --> HL1
+    HL1 --> HL2 --> HLN --> FL
+    ADD --> |c| HL2
+    ADD --> |c| HLN
+    ADD --> |c| FL
+    FL --> V_PRED
+
+    style LATENT fill:#e1f5fe
+    style V_PRED fill:#fce4ec
+    style ADD fill:#fff3e0
+```
+
+### 3.1.1 HeadLayer AdaLN 调制详解图
+
+```mermaid
+flowchart TD
+    C[条件 c] --> SILU1[SiLU]
+    SILU1 --> LINEAR1["Linear(cond_dim → 3×hidden_size)"]
+    LINEAR1 --> CHUNK["chunk → shift, scale, gate"]
+
+    X[输入 x] --> RMSNORM[RMSNorm]
+    RMSNORM --> MOD["modulate<br/>x×(1+scale)+shift"]
+    CHUNK --> |shift,scale| MOD
+    MOD --> MLP["MLP<br/>Linear→GELU→Linear"]
+    MLP --> GATE["× gate"]
+    CHUNK --> |gate| GATE
+    GATE --> RESID["+ 残差 x"]
+    RESID --> OUTPUT[输出]
+
+    style C fill:#fff3e0
+    style X fill:#e1f5fe
+    style OUTPUT fill:#e8f5e9
+```
+
 VibeVoice 的扩散头采用 DiT（Diffusion Transformer）风格，约 300 行代码。
 
 ```
@@ -203,6 +269,30 @@ LLM hidden_state (hidden_size)
 
 ## 3.7 v-prediction 原理
 
+### 3.7.0 三种预测目标对比图
+
+```mermaid
+flowchart LR
+    subgraph epsilon预测
+        E_XT[x_t 加噪数据] --> E_MODEL[模型]
+        E_MODEL --> E_OUT["预测 ε<br/>噪声本身"]
+    end
+
+    subgraph x预测
+        X_XT[x_t 加噪数据] --> X_MODEL[模型]
+        X_MODEL --> X_OUT["预测 x_0<br/>原始数据"]
+    end
+
+    subgraph v预测_VibeVoice使用
+        V_XT[x_t 加噪数据] --> V_MODEL[模型]
+        V_MODEL --> V_OUT["预测 v = α_t·ε - σ_t·x_0<br/>高信噪比→预测-x_0<br/>低信噪比→预测ε"]
+    end
+
+    style V_OUT fill:#e8f5e9
+    style E_OUT fill:#e1f5fe
+    style X_OUT fill:#fff3e0
+```
+
 ### 3.7.1 三种预测目标
 
 | 预测类型 | 目标 | 公式 |
@@ -395,6 +485,33 @@ def sample_speech_tokens(condition, cfg_scale=3.0):
         speech = scheduler.step(v_pred, t, speech).prev_sample
 
     return speech
+```
+
+### 3.12.0 CFG 采样流程图
+
+```mermaid
+flowchart TD
+    NOISE[随机噪声<br/>B,1,vae_dim] --> SPLIT[复制两份]
+
+    SPLIT --> |正条件| COMBINED_S[拼接 speech]
+    SPLIT --> |负条件| COMBINED_S
+
+    POS_COND[positive_condition<br/>有文本条件] --> COMBINED_C[拼接 condition]
+    NEG_COND[negative_condition<br/>空文本条件] --> COMBINED_C
+
+    COMBINED_S --> DH[Diffusion Head<br/>预测 v]
+    COMBINED_C --> DH
+
+    DH --> SPLIT_PRED["chunk(2)"]
+    SPLIT_PRED --> |cond_eps| CFG["CFG 引导<br/>uncond + scale×(cond-uncond)"]
+    SPLIT_PRED --> |uncond_eps| CFG
+
+    CFG --> DPM["DPM-Solver 步进<br/>x_t → x_{t-1}"]
+    DPM --> |循环20步| RESULT[去噪后的<br/>speech latent]
+
+    style NOISE fill:#e1f5fe
+    style CFG fill:#fff3e0
+    style RESULT fill:#e8f5e9
 ```
 
 ### 3.12.1 Classifier-Free Guidance（CFG）

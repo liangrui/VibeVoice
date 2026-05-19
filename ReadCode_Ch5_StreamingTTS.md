@@ -15,6 +15,55 @@
 
 ## 5.2 模型定义（VibeVoiceStreamingModel）
 
+### 5.2.0 Streaming TTS 架构图
+
+```mermaid
+graph TB
+    subgraph 输入
+        VP[Voice Prompt<br/>说话人音色]
+        TEXT[文本输入]
+    end
+
+    subgraph 下层LM_文本编码
+        LM_EMB[embed_tokens]
+        LM_LAYERS["Qwen2 Layers [0:N-1]<br/>norm=Identity"]
+        LM_CACHE[KV Cache]
+    end
+
+    subgraph 上层TTS_LM_语音生成
+        TYPE_EMB["tts_input_types<br/>0=语音 · 1=文本"]
+        TTS_LAYERS["Qwen2 Layers [N:end]<br/>embed_tokens=None"]
+        TTS_CACHE[KV Cache]
+    end
+
+    subgraph 语音生成
+        DH[Diffusion Head<br/>v-prediction]
+        DEC[Acoustic Decoder<br/>流式解码]
+        EOS[BinaryClassifier<br/>EOS检测]
+    end
+
+    subgraph 输出
+        STREAMER[AudioStreamer<br/>流式音频输出]
+    end
+
+    VP --> LM_EMB --> LM_LAYERS --> |hidden_states + type| TTS_LAYERS
+    TEXT --> LM_EMB
+    LM_LAYERS --> LM_CACHE
+    TTS_LAYERS --> TTS_CACHE
+    TTS_LAYERS --> |condition| DH
+    DH --> |speech_latent| DEC
+    DEC --> STREAMER
+    DH --> |speech_latent| AC_CONN[Acoustic Connector]
+    AC_CONN --> |+ type_embed(speech)| TTS_LAYERS
+    TTS_LAYERS --> EOS
+    EOS --> |sigmoid > 0.5| FINISH[结束生成]
+
+    style LM_LAYERS fill:#e1f5fe
+    style TTS_LAYERS fill:#fff3e0
+    style DH fill:#fce4ec
+    style STREAMER fill:#e8f5e9
+```
+
 ### 5.2.1 整体架构
 
 ```
@@ -145,6 +194,39 @@ if eos_logit > 0.5:
 ---
 
 ## 5.5 推理流程详解
+
+### 5.5.0 generate 主循环流程图
+
+```mermaid
+flowchart TD
+    START[开始] --> PHASE1[Phase 1: 预填充 Voice Prompt]
+    PHASE1 --> LM_CACHE[缓存 LM KV Cache]
+    LM_CACHE --> PHASE2[Phase 2: 编码负条件]
+    PHASE2 --> NEG_COND[neg_condition<br/>空文本条件]
+
+    NEG_COND --> LOOP_START{还有文本窗口?}
+    LOOP_START --> |是| TEXT_WIN[取5个文本token]
+    TEXT_WIN --> LM_FWD[下层LM编码<br/>更新KV Cache]
+    LM_FWD --> TTS_FWD["上层TTS LM编码<br/>+ type_embed(text=1)"]
+    TTS_FWD --> POS_COND[positive_condition]
+
+    POS_COND --> SPEECH_LOOP{生成6个语音token}
+    SPEECH_LOOP --> |循环| CFG_SAMPLE[CFG扩散采样<br/>20步DPM-Solver]
+    CFG_SAMPLE --> DECODE[Acoustic Decoder<br/>流式解码]
+    DECODE --> PUT["audio_streamer.put()"]
+    PUT --> FEEDBACK["语音反馈到TTS LM<br/>+ type_embed(speech=0)"]
+    FEEDBACK --> EOS_CHECK{EOS > 0.5?}
+    EOS_CHECK --> |否| SPEECH_LOOP
+    EOS_CHECK --> |是| FINISH[结束]
+
+    SPEECH_LOOP --> |6个完成| LOOP_START
+    LOOP_START --> |否| END["audio_streamer.end()"]
+
+    style PHASE1 fill:#e1f5fe
+    style CFG_SAMPLE fill:#fce4ec
+    style PUT fill:#e8f5e9
+    style FINISH fill:#fff3e0
+```
 
 ### 5.5.1 核心常量
 
@@ -377,6 +459,35 @@ class AsyncAudioStreamer:
 ---
 
 ## 5.8 延迟分析
+
+### 5.8.0 延迟分析图
+
+```mermaid
+graph LR
+    subgraph 首音频延迟_~300ms
+        VP_ENC["Voice Prompt编码<br/>~100ms"]
+        FIRST_LLM["首窗口LLM<br/>~50ms"]
+        FIRST_DIFF["首次扩散采样<br/>~100ms"]
+        FIRST_DEC["首次音频解码<br/>~50ms"]
+    end
+
+    subgraph 稳态每窗口_~100ms
+        ST_LLM["LM编码<br/>~10ms"]
+        ST_DIFF["扩散采样×6<br/>~60ms"]
+        ST_DEC["音频解码×6<br/>~30ms"]
+    end
+
+    subgraph 产出
+        AUDIO["0.8s 音频/窗口"]
+        RTF["RTF = 0.1/0.8 = 0.125<br/>远快于实时"]
+    end
+
+    VP_ENC --> FIRST_LLM --> FIRST_DIFF --> FIRST_DEC
+    ST_LLM --> ST_DIFF --> ST_DEC --> AUDIO --> RTF
+
+    style FIRST_DIFF fill:#fce4ec
+    style RTF fill:#e8f5e9
+```
 
 ### 5.8.1 首音频延迟
 
