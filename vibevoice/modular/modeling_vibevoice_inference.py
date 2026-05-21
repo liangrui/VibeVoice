@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union, Callable
 from tqdm import tqdm
+import inspect
 import torch
 import torch.nn as nn
 
@@ -300,7 +301,13 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         )
 
         max_cache_length = generation_config.max_length - 1
-        self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, max_cache_length, device)
+        _cache_prepare_sig = inspect.signature(self._prepare_cache_for_generation)
+        _cache_prepare_params = list(_cache_prepare_sig.parameters.keys())
+        if 'device' in _cache_prepare_params:
+            self._prepare_cache_for_generation(generation_config, model_kwargs, None, batch_size, max_cache_length, device)
+        else:
+            generation_mode = generation_config.get_generation_mode()
+            self._prepare_cache_for_generation(generation_config, model_kwargs, generation_mode, batch_size, max_cache_length)
         model_kwargs['cache_position'] = torch.arange(input_ids_length, device=device, dtype=torch.long)
         for k, v in model_kwargs.items():
             if isinstance(v, torch.Tensor):
